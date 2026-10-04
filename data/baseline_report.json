@@ -1,0 +1,42 @@
+{
+  "description": "Historical baseline simulations, NOT trained 3B performance",
+  "cost_bps_per_side": 10.0,
+  "results": {
+    "cash": {
+      "sessions": 126,
+      "total_return": 0.0,
+      "annualized_return": 0.0,
+      "sharpe_zero_rf": 0,
+      "max_drawdown": 0.0,
+      "entries": 0,
+      "exposed_sessions": 0
+    },
+    "buy_hold": {
+      "sessions": 126,
+      "total_return": 0.03449212907334931,
+      "annualized_return": 0.0701739651147113,
+      "sharpe_zero_rf": 1.97175898306185,
+      "max_drawdown": -0.01705502167306905,
+      "entries": 1,
+      "exposed_sessions": 126
+    },
+    "trend": {
+      "sessions": 126,
+      "total_return": 0.017723562805125326,
+      "annualized_return": 0.03576125028875787,
+      "sharpe_zero_rf": 1.5126055108525163,
+      "max_drawdown": -0.01477704309338479,
+      "entries": 9,
+      "exposed_sessions": 65
+    },
+    "reversion": {
+      "sessions": 126,
+      "total_return": 0.0022970339032895026,
+      "annualized_return": 0.004599344171331898,
+      "sharpe_zero_rf": 0.43448235054773054,
+      "max_drawdown": -0.004876962549907882,
+      "entries": 6,
+      "exposed_sessions": 21
+    }
+  }
+}
