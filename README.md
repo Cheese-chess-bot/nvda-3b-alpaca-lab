@@ -1,5 +1,21 @@
 # NVDA 3B Research Lab
 
+## New: dual-T4 Qwen news + math + PPO pipeline
+
+Open [NVDA_Kaggle_Dual_T4.ipynb](NVDA_Kaggle_Dual_T4.ipynb) in Kaggle with **GPU T4 x2** and Internet enabled. The notebook contains one executable cell and the full setup/resume instructions. Reviewable Python source is in [kaggle_v2/](kaggle_v2/).
+
+- Frozen Qwen2.5-3B extracts timestamped news sentiment, relevance, uncertainty and event categories.
+- 85 numerical market features plus news signals produce 97 combined features, with training-only normalization.
+- A separate actor-critic trains with actual PPO/GAE using both GPUs.
+- Up to three candidates compete on validation data, with a single-test ledger, independent risk limits and gated research promotion.
+- Atomic checkpoints, cached news extraction, bounded retries and integrity-triggered rollback provide recovery.
+
+Supply news through an attached JSONL file or Alpaca Kaggle Secrets. Qwen stays frozen; PPO learns the trading policy. The new policy produces proposals and is **not yet connected to the older Alpaca order-execution runner below**. Historical starter dates are already inspected, so promotion requires genuinely fresh test dates after 2026-10-02.
+
+Validation: 20 new CPU tests plus the 24 existing tests pass, and feature preparation was checked on all 1,378 rows. GPU training and Kaggle execution have not been run in the delivery environment. No trained model or profitability result is included.
+
+The remaining sections document the original supervised LoRA pipeline.
+
 Runnable Python research and Alpaca **paper-only** execution code. Includes actual Alpaca-plugin daily data, a dataset builder, Qwen2.5-3B LoRA/QLoRA classification training, cost-aware evaluation, model promotion/rollback, and a durable order journal. No trained weights or proven trading edge are included. No orders were placed to build this package.
 
 ## What this version does
