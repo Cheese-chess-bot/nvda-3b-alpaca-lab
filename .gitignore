@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+execution.sqlite*
+*.lock
+runs/
+champion.json
+previous_champion.json
+evaluation_ledger.json
+HALT

@@ -1,0 +1,10 @@
+# Reproducible API target; GPU path has not been executed in the delivery environment.
+# Install an appropriate CUDA-enabled PyTorch wheel for your GPU before this file.
+torch>=2.6,<2.7
+transformers==4.51.3
+peft==0.15.2
+accelerate==1.6.0
+bitsandbytes==0.45.5
+huggingface-hub>=0.30,<1
+safetensors>=0.5,<1
+tzdata>=2025.1
