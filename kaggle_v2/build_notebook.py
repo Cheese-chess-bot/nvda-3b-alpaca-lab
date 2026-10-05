@@ -1,7 +1,7 @@
 import ast,json
 from pathlib import Path
 root=Path(__file__).resolve().parent
-names=['core.py','prepare.py','ppo.py','evaluate.py','runtime.py','test_core.py']
+names=['hardware.py','core.py','prepare.py','ppo.py','evaluate.py','runtime.py','test_core.py']
 files={name:(root/name).read_text() for name in names}
 for name,source in files.items(): ast.parse(source,filename=name)
 cell=(root/'launcher_prefix.py').read_text()+'\nFILES = '+repr(files)+'\n\n'+(root/'launcher_suffix.py').read_text()

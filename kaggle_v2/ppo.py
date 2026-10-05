@@ -1,4 +1,4 @@
-"""Actual clipped PPO with GAE and synchronous two-GPU DDP gradient updates."""
+"""Clipped PPO with GAE on CPU, NVIDIA CUDA, AMD ROCm or Intel XPU; optional DDP."""
 import os, random, math
 from pathlib import Path
 from datetime import timedelta
@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from torch.distributions import Categorical
 from core import *
+from hardware import resolve_device, clear_cache
 
 
 class ActorCritic(nn.Module):
@@ -45,13 +46,25 @@ def evaluate(model,part,device,cost=POLICY['cost_bps']):
     return result
 
 
+class SingleDevice(nn.Module):
+    def __init__(self,module):
+        super().__init__(); self.module=module
+    def forward(self,x): return self.module(x)
+
+
 def train():
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel as DDP
-    rank=int(os.environ['LOCAL_RANK']); world=int(os.environ['WORLD_SIZE'])
-    if world!=2 or torch.cuda.device_count()!=2: raise RuntimeError('Exactly two GPUs required')
-    torch.cuda.set_device(rank); device=torch.device('cuda',rank)
-    dist.init_process_group('nccl',timeout=timedelta(minutes=10))
+    rank=int(os.environ.get('LOCAL_RANK','0')); world=int(os.environ.get('WORLD_SIZE','1'))
+    device=resolve_device(rank=rank); distributed=world>1
+    torch.set_num_threads(max(1,int(os.environ.get('NVDA_CPU_THREADS','2'))))
+    backend={'cuda':'nccl','xpu':'xccl','cpu':'gloo'}[device.type]
+    if distributed: dist.init_process_group(backend,timeout=timedelta(minutes=10))
+    def sync(tensor,op=None):
+        if distributed: dist.all_reduce(tensor,op=op or dist.ReduceOp.SUM)
+    def barrier():
+        if distributed: dist.barrier()
+    if rank==0: print('PPO device:',device,'workers:',world,'backend:',backend if distributed else 'single',flush=True)
     work=Path(os.environ['NVDA_WORK']); cfg=read(work/'config.json'); data=read(work/'prepared.json')
     if data['config_hash']!=digest(cfg) or data['policy_hash']!=digest(POLICY): raise RuntimeError('Configuration mismatch')
     partition=data['partitions']; trainpart=partition['train']; dimension=len(data['names'])+4
@@ -60,9 +73,9 @@ def train():
     try:
         for candidate in range(cfg['candidates']):
             seed=cfg['seed']+candidate*10000
-            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
             model=ActorCritic(dimension).to(device)
-            ddp=DDP(model,device_ids=[rank],broadcast_buffers=False)
+            ddp=DDP(model,device_ids=([rank] if device.type!='cpu' else None),broadcast_buffers=False) if distributed else SingleDevice(model)
             lr=cfg['learning_rates'][candidate]
             optimizer=torch.optim.Adam(ddp.parameters(),lr=lr,eps=1e-5)
             ckpt=checkpoint_dir/f'candidate_{candidate}.pt'
@@ -79,7 +92,7 @@ def train():
                 # Every update starts fresh seeded episodes. A saved update is exactly replayable
                 # without serializing Python, NumPy, CUDA RNG or environment internals.
                 update_seed=seed+update*17+rank*1000000
-                rng=np.random.default_rng(update_seed); torch.manual_seed(update_seed); torch.cuda.manual_seed(update_seed)
+                rng=np.random.default_rng(update_seed); torch.manual_seed(update_seed)
                 env=MarketEnv(trainpart['x'],trainpart['returns'])
                 episode=min(128,len(trainpart['x'])); max_start=len(trainpart['x'])-episode
                 obs=env.reset(int(rng.integers(max_start+1)),episode)
@@ -100,9 +113,9 @@ def train():
                 bobs=torch.as_tensor(np.stack(observations),device=device)
                 bact=torch.as_tensor(actions,device=device); blogp=torch.as_tensor(logps,device=device)
                 badv=torch.as_tensor(advantages,device=device); btarget=torch.as_tensor(targets,device=device)
-                # Normalize over BOTH workers, not independently per GPU.
+                # Normalize over every participating worker.
                 sums=torch.stack((badv.sum(),(badv*badv).sum(),torch.tensor(float(len(badv)),device=device)))
-                dist.all_reduce(sums)
+                sync(sums)
                 mean=sums[0]/sums[2]; variance=(sums[1]/sums[2]-mean*mean).clamp(min=1e-8)
                 badv=(badv-mean)/variance.sqrt()
                 ddp.train(); stop_kl=False; loss_value=0.; kl_value=0.
@@ -115,17 +128,17 @@ def train():
                         surrogate=torch.minimum(ratio*badv[idx],ratio.clamp(.8,1.2)*badv[idx])
                         loss=-surrogate.mean()+.5*(value-btarget[idx]).square().mean()-.01*distribution.entropy().mean()
                         valid=torch.tensor(int(torch.isfinite(loss).item()),device=device)
-                        dist.all_reduce(valid,op=dist.ReduceOp.MIN)
+                        sync(valid,op=dist.ReduceOp.MIN)
                         if not valid.item(): raise RuntimeError('Non-finite PPO loss; last atomic checkpoint retained')
                         optimizer.zero_grad(set_to_none=True); loss.backward()
                         torch.nn.utils.clip_grad_norm_(ddp.parameters(),.5,error_if_nonfinite=True)
                         optimizer.step()
-                        kl=((ratio-1)-logratio).mean().detach(); dist.all_reduce(kl); kl/=world
+                        kl=((ratio-1)-logratio).mean().detach(); sync(kl); kl/=world
                         loss_value=float(loss.item()); kl_value=float(kl.item())
                         if kl_value>.03: stop_kl=True; break
                     if stop_kl: break
                 # All ranks must wait while rank zero validates the same policy.
-                dist.barrier()
+                barrier()
                 if rank==0:
                     val=evaluate(ddp.module,partition['validation'],device)
                     value=score(val); improved=value>best+1e-8
@@ -140,8 +153,10 @@ def train():
                         best_metrics=best_metrics,history=history,stale=stale,done=done))
                     dump(work/f'candidate_{candidate}_history.json',history)
                     print(f'Candidate {candidate} update {update+1}: validation net={val["total_return"]:.4%}, DD={val["max_drawdown"]:.3%}',flush=True)
-                flag=torch.tensor(int(done),device=device); dist.broadcast(flag,src=0); done=bool(flag.item())
-                dist.barrier()
+                flag=torch.tensor(int(done),device=device)
+                if distributed: dist.broadcast(flag,src=0)
+                done=bool(flag.item())
+                barrier()
             if rank==0:
                 state=torch.load(ckpt,map_location='cpu',weights_only=True)
                 bundle=work/f'candidate_{candidate}.pt'
@@ -151,14 +166,14 @@ def train():
                     validation=state['best_metrics'],candidate=candidate))
                 candidates.append(dict(candidate=candidate,bundle=bundle.name,validation=state['best_metrics'],
                                        score=score(state['best_metrics']),sha256=filehash(bundle)))
-            dist.barrier(); del ddp,model,optimizer; torch.cuda.empty_cache()
+            barrier(); del ddp,model,optimizer; clear_cache(device)
         if rank==0:
             winner=max(candidates,key=lambda c:c['score'])
             dump(work/'selection.json',dict(fingerprint=data['fingerprint'],candidates=candidates,winner=winner,
                  selection_rule='validation total_return minus 2*max_drawdown; never select on test'))
             print('Validation selected candidate',winner['candidate'],flush=True)
     finally:
-        dist.destroy_process_group()
+        if distributed: dist.destroy_process_group()
 
 
 if __name__=='__main__': train()
