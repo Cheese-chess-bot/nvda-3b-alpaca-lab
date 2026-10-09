@@ -1,5 +1,5 @@
 """Clipped PPO with GAE on CPU, NVIDIA CUDA, AMD ROCm or Intel XPU; optional DDP."""
-import os, random, math
+import os, random, math, shutil
 from pathlib import Path
 from datetime import timedelta
 import numpy as np
@@ -28,7 +28,31 @@ def save_torch(path,obj):
     temp=path.with_name(path.name+'.tmp')
     with open(temp,'wb') as f:
         torch.save(obj,f); f.flush(); os.fsync(f.fileno())
+    checksum=path.with_suffix(path.suffix+'.sha256')
+    backup=path.with_suffix(path.suffix+'.bak')
+    if path.exists() and checksum.exists() and checksum.read_text()==filehash(path):
+        shutil.copyfile(path,backup)
+        backup.with_suffix(backup.suffix+'.sha256').write_text(filehash(backup))
     os.replace(temp,path)
+    tag=checksum.with_suffix('.tmp'); tag.write_text(filehash(path)); os.replace(tag,checksum)
+
+
+def load_checkpoint(path,fingerprint):
+    """Use only checksummed checkpoints; one verified predecessor can repair corruption."""
+    path=Path(path)
+    for candidate in (path,path.with_suffix(path.suffix+'.bak')):
+        try:
+            tag=candidate.with_suffix(candidate.suffix+'.sha256')
+            if not tag.exists() or tag.read_text()!=filehash(candidate): continue
+            state=torch.load(candidate,map_location='cpu',weights_only=True)
+            if state['fingerprint']!=fingerprint: raise RuntimeError('Checkpoint/data mismatch')
+            if candidate!=path:
+                temp=path.with_suffix('.repair'); shutil.copyfile(candidate,temp); os.replace(temp,path)
+                path.with_suffix(path.suffix+'.sha256').write_text(filehash(path))
+                print('Recovered verified previous checkpoint; trial budget unchanged.',flush=True)
+            return state
+        except (OSError,EOFError): continue
+    raise RuntimeError('No verified checkpoint available; retain run for review, never reset its trial history')
 
 
 def choose_model(model,device):
@@ -70,6 +94,11 @@ def train():
     partition=data['partitions']; trainpart=partition['train']; dimension=len(data['names'])+4
     checkpoint_dir=work/'checkpoints'; checkpoint_dir.mkdir(exist_ok=True)
     candidates=[]
+    if rank==0 and not cfg.get('evolve',False):
+        from ledger import Ledger
+        memory=Ledger(os.environ.get('NVDA_STATE',str(work)))
+        memory.reserve_trials('ppo:'+data['fingerprint'],cfg['candidates']*cfg['updates'])
+        memory.close()
     try:
         for candidate in range(cfg['candidates']):
             seed=cfg['seed']+candidate*10000
@@ -81,7 +110,7 @@ def train():
             ckpt=checkpoint_dir/f'candidate_{candidate}.pt'
             history=[]; best=-float('inf'); best_state=None; best_metrics=None; stale=0; start=0; done=False
             if ckpt.exists():
-                state=torch.load(ckpt,map_location='cpu',weights_only=True)
+                state=load_checkpoint(ckpt,data['fingerprint'])
                 if state['fingerprint']!=data['fingerprint']: raise RuntimeError('Checkpoint/data mismatch')
                 ddp.module.load_state_dict(state['model']); optimizer.load_state_dict(state['optimizer'])
                 history=state['history']; best=state['best']; best_state=state['best_state']; best_metrics=state['best_metrics']
@@ -109,7 +138,7 @@ def train():
                     if terminal: obs=env.reset(int(rng.integers(max_start+1)),episode)
                 with torch.no_grad():
                     _,nv=ddp.module(torch.as_tensor(obs,device=device).unsqueeze(0))
-                advantages,targets=gae(rewards,values,dones,float(nv.item()))
+                advantages,targets=gae(rewards,values,dones,float(nv.item()),gamma=cfg.get('gamma',.99))
                 bobs=torch.as_tensor(np.stack(observations),device=device)
                 bact=torch.as_tensor(actions,device=device); blogp=torch.as_tensor(logps,device=device)
                 badv=torch.as_tensor(advantages,device=device); btarget=torch.as_tensor(targets,device=device)
@@ -126,7 +155,7 @@ def train():
                         logits,value=ddp(bobs[idx]); distribution=Categorical(logits=logits)
                         logp=distribution.log_prob(bact[idx]); logratio=logp-blogp[idx]; ratio=logratio.exp()
                         surrogate=torch.minimum(ratio*badv[idx],ratio.clamp(.8,1.2)*badv[idx])
-                        loss=-surrogate.mean()+.5*(value-btarget[idx]).square().mean()-.01*distribution.entropy().mean()
+                        loss=-surrogate.mean()+.5*(value-btarget[idx]).square().mean()-cfg.get('entropy_coef',.01)*distribution.entropy().mean()
                         valid=torch.tensor(int(torch.isfinite(loss).item()),device=device)
                         sync(valid,op=dist.ReduceOp.MIN)
                         if not valid.item(): raise RuntimeError('Non-finite PPO loss; last atomic checkpoint retained')
@@ -158,7 +187,7 @@ def train():
                 done=bool(flag.item())
                 barrier()
             if rank==0:
-                state=torch.load(ckpt,map_location='cpu',weights_only=True)
+                state=load_checkpoint(ckpt,data['fingerprint'])
                 bundle=work/f'candidate_{candidate}.pt'
                 save_torch(bundle,dict(schema=VERSION,weights=state['best_state'],dimension=dimension,
                     names=data['names'],scaler=data['scaler'],policy=POLICY,fingerprint=data['fingerprint'],

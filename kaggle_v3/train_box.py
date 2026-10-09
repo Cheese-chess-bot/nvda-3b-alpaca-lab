@@ -24,34 +24,7 @@ def dump(path,value):
     os.replace(temp,path)
 
 
-def run(command,env=None,cwd=None,log=None,retries=0):
-    for attempt in range(retries+1):
-        handle=open(log,'a',encoding='utf-8') if log else None
-        process=subprocess.Popen(list(map(str,command)),env=env,cwd=cwd,stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,text=True,bufsize=1,start_new_session=os.name!='nt')
-        tail=[]
-        try:
-            for line in process.stdout:
-                print(line,end='',flush=True); tail=(tail+[line])[-80:]
-                if handle: handle.write(line); handle.flush()
-            code=process.wait()
-        except BaseException:
-            if process.poll() is None:
-                if os.name=='nt':
-                    subprocess.run(['taskkill','/PID',str(process.pid),'/T','/F'],capture_output=True)
-                else:
-                    os.killpg(process.pid,signal.SIGTERM)
-                    try: process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(process.pid,signal.SIGKILL); process.wait()
-            raise
-        finally:
-            if handle: handle.close()
-        if code==0: return
-        retry=any(w in ''.join(tail).lower() for w in ('connection reset','timed out','temporary failure','nccl error'))
-        if not retry or attempt>=retries:
-            raise RuntimeError(f'Process exited {code}. Details are above; completed checkpoints are retained.')
-        print('Retrying transient failure from saved state',attempt+1,flush=True); time.sleep(3)
+from recovery import run, controller_lock
 
 
 def query(python,code,env=None):
@@ -129,25 +102,26 @@ def main(argv=None):
     parser.add_argument('--news-jsonl',default=''); parser.add_argument('--dataset-dir',default='')
     parser.add_argument('--updates',type=int,default=0); parser.add_argument('--candidates',type=int,default=0)
     parser.add_argument('--max-news-articles',type=int,default=6000)
+    parser.add_argument('--evolve',action='store_true',help='Run bounded walk-forward research and retain failures')
+    parser.add_argument('--evolution-revisions',type=int,default=3)
+    parser.add_argument('--budget-minutes',type=int,default=240)
     parser.add_argument('--final-test',action='store_true'); parser.add_argument('--no-install',action='store_true',help='Use the current preconfigured Python; intended for development/CI')
     args=parser.parse_args(argv)
     aliases=selected_models(args.models)
     if not re.fullmatch(r'[A-Za-z0-9_-]+',args.cycle): raise ValueError('Invalid cycle name')
+    if not 1<=args.evolution_revisions<=3 or not 1<=args.budget_minutes<=720: raise ValueError('Invalid evolution/time budget')
     if args.max_gpus<1 or args.threads<1 or args.updates<0 or not 0<=args.candidates<=3 or args.max_news_articles<1:
         raise ValueError('Invalid training budget')
     project=Path(args.project).resolve(); base=Path(args.work_dir).resolve(); base.mkdir(parents=True,exist_ok=True)
     work=base/'cycles'/args.cycle; work.mkdir(parents=True,exist_ok=True)
     # One controller per output root; prevents concurrent ledger/checkpoint writes.
-    lock=base/'controller.lock'
-    try: fd=os.open(lock,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-    except FileExistsError: raise RuntimeError('A controller lock exists. Stop the other run; after a crash verify it is stopped before removing controller.lock.') from None
-    with os.fdopen(fd,'w') as f: json.dump(dict(pid=os.getpid(),cycle=args.cycle),f)
+    lease=controller_lock(base/'controller.lock'); lease.__enter__()
     try:
         python=setup_python(base,args.no_install)
         env=os.environ.copy()
         for key in ('APCA_API_KEY_ID','APCA_API_SECRET_KEY','HF_TOKEN','HUGGING_FACE_HUB_TOKEN','LOCAL_RANK','RANK','WORLD_SIZE','MASTER_ADDR','MASTER_PORT'):
             env.pop(key,None)
-        env.update(NVDA_WORK=str(work),NVDA_STATE=str(base),NVDA_PROJECT=str(project),NVDA_CPU_THREADS=str(args.threads),
+        env.update(NVDA_DEADLINE=str(time.time()+args.budget_minutes*60),NVDA_WORK=str(work),NVDA_STATE=str(base),NVDA_PROJECT=str(project),NVDA_CPU_THREADS=str(args.threads),
             PYTHONPATH=str(SOURCE)+os.pathsep+str(project)+os.pathsep+os.environ.get('PYTHONPATH',''),
             TOKENIZERS_PARALLELISM='false',PYTHONUNBUFFERED='1',OMP_NUM_THREADS=str(args.threads),
             HF_HOME=str(Path('/kaggle/tmp/nvda-box-v3-model-cache') if Path('/kaggle/working').exists() else base/'model-cache'))
@@ -181,7 +155,7 @@ def main(argv=None):
         revision=subprocess.run(['git','rev-parse','HEAD'],cwd=project,text=True,capture_output=True)
         source_revision=revision.stdout.strip() if revision.returncode==0 else 'local-unversioned'
         data=Path(args.dataset_dir).resolve() if args.dataset_dir else project/'data'
-        requested=dict(schema='nvda-news-ppo-v3.0',entrypoint='kaggle-box-v3',news_models=aliases,news_prompt=PROMPT_VERSION,seed=42,hardware=plan,
+        requested=dict(schema='nvda-news-ppo-v3.0',entrypoint='kaggle-box-v3',news_models=aliases,news_prompt=PROMPT_VERSION,seed=42,hardware=plan,evolve=args.evolve,evolution_revisions=args.evolution_revisions,budget_minutes=args.budget_minutes,
             updates=args.updates or (16 if plan['kind']=='cpu' else 40),
             candidates=args.candidates or (1 if plan['kind']=='cpu' else 3),
             learning_rates=[3e-4,1e-4,5e-4],rollout_steps=128 if plan['kind']=='cpu' else 256,
@@ -207,6 +181,7 @@ def main(argv=None):
         run([python,'-m','unittest','discover','-s',SOURCE,'-p','test_core.py','-q'],env=env)
         run([python,'-m','unittest','discover','-s',SOURCE,'-p','test_hardware.py','-q'],env=env)
         run([python,'-m','unittest','discover','-s',SOURCE,'-p','test_ensemble.py','-q'],env=env)
+        run([python,'-m','unittest','discover','-s',SOURCE,'-p','test_evolution.py','-q'],env=env)
         ingest_env=dict(env,**keys)
         run([python,SOURCE/'prepare.py','collect'],env=ingest_env,log=work/'ingestion.log')
         keys.clear(); del ingest_env
@@ -218,7 +193,10 @@ def main(argv=None):
                 launch(python,'sentiment.py',['--model',alias],env,plan['workers'],work/(alias+'_news.log'))
         model_env.pop('HF_TOKEN',None); token=None
         run([python,SOURCE/'prepare.py','assemble'],env=env,log=work/'preparation.log')
-        launch(python,'ppo.py',[],env,plan['workers'],work/'ppo.log')
+        if args.evolve:
+            run([python,SOURCE/'evolution.py'],env=env,log=work/'evolution.log')
+        else:
+            launch(python,'ppo.py',[],env,plan['workers'],work/'ppo.log')
         if args.final_test: run([python,SOURCE/'evaluate.py'],env=env,log=work/'evaluation.log')
         else: print('Final holdout not evaluated. Enable RUN_FINAL_TEST only when ready.',flush=True)
         selection=read(work/'selection.json'); prepared=read(work/'prepared.json')
@@ -226,21 +204,24 @@ def main(argv=None):
                      model_coverage=prepared['model_coverage'],models=config['models'],
                      math_only=prepared['math_only'],winner=selection['winner'],final_test=args.final_test,
                      work_dir=str(work),repo_commit=source_revision)
+        summary['evolution']=read(work/'evolution'/'summary.json') if args.evolve else None
         dump(work/'box_result.json',summary)
         dump(work/'run_manifest.json',dict(schema='nvda-v3-run-manifest-1',cycle=args.cycle,
              config_hash=digest(config),data_fingerprint=prepared['fingerprint'],models=config['models'],
              news_models=aliases,model_coverage=prepared['model_coverage'],math_only=prepared['math_only'],
              selected_policy=selection['winner'],holdout_report='holdout_report.json' if args.final_test else None,
-             evolution_status='manual_research_only',promotion_enabled=False))
+             evolution_status=read(work/'evolution'/'summary.json')['status'] if args.evolve else 'manual_research_only',promotion_enabled=False))
         archive=work/'kaggle-box-policy.zip'
         with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as z:
             for p in sorted(SOURCE.glob('*.py')): z.write(p,'kaggle_v3/'+p.name)
-            for pattern in ('candidate_*.pt','candidate_*_history.json','config.json','selection.json','hardware.json','box_result.json','holdout_report.json','run_manifest.json'):
+            for p in sorted((work/'evolution').rglob('*.json')) if args.evolve else []:
+                if p.name not in ('prepared.json','config.json'): z.write(p,str(p.relative_to(work)))
+            for pattern in ('candidate_*.pt','evolved_policy.pt','candidate_*_history.json','config.json','selection.json','hardware.json','box_result.json','holdout_report.json','run_manifest.json'):
                 for p in work.glob(pattern): z.write(p,p.name)
         print(json.dumps(summary,indent=2)); print('Policy download:',archive,flush=True)
         print('Keep the full nvda-box output directory to resume, including the global ledger and checkpoints. No orders submitted.',flush=True)
     finally:
-        lock.unlink(missing_ok=True)
+        lease.__exit__(None,None,None)
 
 
 if __name__=='__main__':

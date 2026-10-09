@@ -10,8 +10,9 @@ from evaluate import load_bundle
 
 def propose(work, raw_features, *, equity, position_weight, peak_equity, day_return,
             quote_age_seconds, features_as_of, decision_as_of,
-            open_orders=False, position_reconciled=True):
-    work=Path(work); halt=work/'risk_halt.json'; registry=work/'champion.json'
+            open_orders=False, position_reconciled=True, registry_name='champion.json'):
+    if registry_name not in ('champion.json','paper_candidate.json'): raise ValueError('Invalid registry')
+    work=Path(work); halt=work/'risk_halt.json'; registry=work/registry_name
     try:
         champion=verify_champion(registry)
     except Exception as exc:

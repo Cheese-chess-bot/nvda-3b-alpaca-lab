@@ -37,7 +37,9 @@ JSONL records require `id`, `source`, a timezone-qualified `available_at`, and `
 | `hardware.py` | CPU/CUDA/ROCm/XPU probing and routing |
 | `evaluate.py`, `runtime.py` | Reserved-test reporting and proposal-only risk checks |
 | `train_box.py` | Setup, stage orchestration, outputs and run manifest |
-| `EVOLUTION.md` | Planned controller contract and promotion workflow |
+| `research.py`, `ledger.py`, `validation.py`, `evolution.py` | Bounded PPO evolution, memory and walk-forward gates |
+| `recovery.py`, `risk.py`, `paper.py` | Verified recovery, independent limits and opt-in paper adapter |
+| `EVOLUTION.md` | Evolution, recovery and paper workflow |
 
 The policy receives 124 features: 85 market features, 12 Qwen signals, 12 Gemma signals, 12 consensus signals, and 3 disagreement/pair-coverage signals. Invalid model output stays missing. Consensus for an article requires every enabled analyst; disagreement is the mean absolute sentiment difference divided by two. Event disagreement maps to `other`, and consensus uncertainty uses the maximum. Weights are fixed, not tuned on the test set. Single-model and math-only ablations retain the same schema and explicit missing flags.
 
@@ -51,14 +53,14 @@ NVIDIA uses NF4 weights. Qwen computes in FP16; Gemma computes in FP32, includin
 
 Outputs use `nvda-box-v3/cycles/<cycle>/`. Keep the whole output folder for resume: model-specific news caches, checkpoints, configuration, ledger and selected weights. `kaggle-box-policy.zip` is a portable review/inference bundle, not a complete resumable run. V2 and V3 policy schemas differ; V2 checkpoints cannot be resumed as V3. Code/device/data/model-set changes require a new cycle, never deletion of the evaluation ledger.
 
-`run_manifest.json` records both model revisions, coverage, configuration/data fingerprints and the selected policy checksum for the later evolution controller. The default runs training/validation only. `--final-test` explicitly consumes the holdout; automatic promotion is disabled in V3. The existing Alpaca order runner is not connected to these policies. No orders are submitted.
+`run_manifest.json` records both model revisions, coverage, configuration/data fingerprints and the selected policy checksum for the evolution controller. The notebook defaults to bounded evolution; the plain CLI uses ordinary PPO unless `--evolve` is supplied. Both default to development data only. `--final-test` explicitly consumes the holdout; automatic promotion is disabled in V3. The original repository order runner is unchanged. V3 now has its own separate paper adapter. Training submits no orders. The separate `paper.py` adapter requires explicit setup, a passed fresh holdout and `--submit-paper`.
 
 ## Verification and limits
 
-Validated locally: 43 V3 tests pass. A real two-update CPU PPO run completed with 124 features; completed-checkpoint resume preserved identical policy bytes and the saved bundle reloaded. A clearly labelled synthetic two-analyst cache also passed full feature assembly across all chronological rows. The pinned Gemma3 class also generated text from a tiny random test configuration; this checks the API, not the downloaded 4B model.
+Validated locally: 65 V3 tests pass. A real two-update CPU PPO run completed with 124 features; completed-checkpoint resume preserved identical policy bytes and the saved bundle reloaded. A clearly labelled synthetic two-analyst cache also passed full feature assembly across all chronological rows. The pinned Gemma3 class also generated text from a tiny random test configuration; this checks the API, not the downloaded 4B model.
 
-Run `python -m unittest discover -s kaggle_v3 -p 'test_*.py' -v` with NumPy installed. Tests cover chronology, risk, device routing, analyst disagreement, missing signals, cache provenance and model precision selection. Physical GPU execution and full Qwen/Gemma downloads/inference require validation in the target environment. A synthetic fixture verifies wiring only; it is never evidence of model quality or trading performance.
+Run `python -m unittest discover -s kaggle_v3 -p 'test_*.py' -v` with NumPy and PyTorch installed. Tests cover chronology, risk, device routing, analyst disagreement, missing signals, cache provenance and model precision selection. Physical GPU execution and full Qwen/Gemma downloads/inference require validation in the target environment. A synthetic fixture verifies wiring only; it is never evidence of model quality or trading performance.
 
-Historical text may be present in pretrained-model knowledge. Adding Gemma does not establish an edge, and using two models does not guarantee independent errors. Current execution is daily-bar simulation with fixed costs; see the existing research limitations in the repository README. Self-evolution is a planned next stage, not an active autonomous service.
+Historical text may be present in pretrained-model knowledge. Adding Gemma does not establish an edge, and using two models does not guarantee independent errors. Current execution is daily-bar simulation with fixed costs; see the existing research limitations in the repository README. The notebook now enables bounded PPO parameter evolution. See [EVOLUTION.md](EVOLUTION.md) for memory, recovery and the separate opt-in paper adapter. This is a finite research job, not an always-on service.
 
 Sources: [Gemma 3 model card](https://huggingface.co/google/gemma-3-4b-it), [pinned Transformers API](https://huggingface.co/docs/transformers/v4.51.3/model_doc/gemma3), [upstream FP16 issue](https://github.com/huggingface/transformers/issues/36822).

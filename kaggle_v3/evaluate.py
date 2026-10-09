@@ -10,6 +10,8 @@ from ppo import ActorCritic, evaluate
 def load_bundle(path,device='cpu'):
     b=torch.load(path,map_location='cpu',weights_only=True)
     if b['schema']!=VERSION or b['policy']!=POLICY: raise RuntimeError('Incompatible policy bundle')
+    if b['dimension']!=len(b['names'])+4 or not all(torch.isfinite(v).all() for v in b['weights'].values()):
+        raise RuntimeError('Invalid policy dimensions or non-finite weights')
     model=ActorCritic(b['dimension']).to(device); model.load_state_dict(b['weights']); model.eval()
     return b,model
 
@@ -25,6 +27,16 @@ def main():
         if report['fingerprint']!=data['fingerprint'] or report['candidate_sha256']!=winner['sha256']:
             raise RuntimeError('An evaluated run cannot be modified')
         print('Existing holdout result:',json.dumps(report,indent=2)); return
+    from ledger import Ledger
+    memory=Ledger(state)
+    try: fresh_after=memory.fresh_after
+    finally: memory.close()
+    if cfg.get('evolve'):
+        research=read(work/'evolution'/'summary.json')
+        if not research['passed'] or research['winner']['sha256']!=winner['sha256']:
+            raise RuntimeError('Research failed or artifact changed; final test remains sealed')
+        if data['partitions']['test']['dates'][0]<=fresh_after:
+            raise RuntimeError('Collect fresh holdout dates after '+fresh_after+'; old dates remain research only')
     test=data['partitions']['test']; registry=state/'champion.json'; incumbent_entry=None
     if registry.exists(): incumbent_entry=verify_champion(registry)
     # Reserve before loading outcomes into evaluation. A crash cannot unlock reuse.
@@ -48,7 +60,7 @@ def main():
     checks=promotion_checks(candidate,stress,baselines,incumbent)
     # Bundled dates were already inspected during earlier research. They cannot
     # justify a newly validated champion. New data must start AFTER that boundary.
-    checks['fresh_holdout_dates']=test['dates'][0]>'2026-10-02'
+    checks['fresh_holdout_dates']=test['dates'][0]>fresh_after
     report=dict(fingerprint=data['fingerprint'],candidate_sha256=winner['sha256'],candidate=candidate,stress=stress,
         baselines=baselines,incumbent=incumbent,checks=checks,passed=all(checks.values()),
         news_coverage=data['coverage'],math_only=data['math_only'],test_start=test['dates'][0],test_end=test['label_ends'][-1],
@@ -57,6 +69,8 @@ def main():
           'Frozen Qwen/Gemma are not fine-tuned; historical text can be affected by pretrained-model knowledge.',
           'Validation selects a finite candidate set. One short holdout cannot establish profitability.',
           'IEX historical sample; not all market data modalities. No live or paper orders are submitted.'])
+    report['fresh_after']=fresh_after
+    report['research_passed']=bool(cfg.get('evolve') and research['passed'])
     dump(reportfile,report)
     promoted=False
     if cfg['auto_promote_research']:

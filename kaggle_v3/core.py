@@ -244,11 +244,20 @@ def claim_holdout(path,start,end,run_id):
     """Single-controller ledger. Crash after reservation consumes the holdout.
     Keep this file across sessions; deleting it invalidates the research protocol.
     """
-    rows=read(path) if Path(path).exists() else []
-    if any(not (end<r['start'] or start>r['end']) for r in rows):
-        raise RuntimeError('Holdout overlaps an already consumed interval. Collect fresh dates.')
-    rows.append(dict(start=start,end=end,run_id=run_id,status='consumed_before_evaluation'))
-    dump(path,rows)
+    from ledger import Ledger
+    memory=Ledger(Path(path).parent)
+    try:
+        memory.import_history()
+        # Also import a caller-specific legacy filename before reserving.
+        rows=read(path) if Path(path).exists() else []
+        for r in rows:
+            memory.db.execute('INSERT OR IGNORE INTO holdouts VALUES (?,?,?,?,?)',
+                ('legacy:'+digest(r),r['start'],r['end'],'legacy',r.get('run_id','legacy')))
+        memory.claim_holdout(start,end,run_id)
+        rows.append(dict(start=start,end=end,run_id=run_id,status='consumed_before_evaluation'))
+        dump(path,rows)
+    finally: memory.close()
+
 
 
 def promotion_checks(candidate,stress,baselines,incumbent=None):
